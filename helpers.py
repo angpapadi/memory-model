@@ -1,299 +1,515 @@
 import nest
 import os
 import numpy as np, pylab as plt
-import collections
+import collections,math, random
+import parameters 
+from mpi4py import MPI
+import nest.topology as tp
 
-def update(d, u):
-    for k, v in u.items():
-        if isinstance(v, collections.Mapping):
-            r = update(d.get(k, {}), v)
-            d[k] = r
-        else:
-            d[k] = u[k]
-    return d
+#__________________Functions involved in network creation________________________#
+def CreateMC(basket_nodes):
+    # load parameters
+    neuron_model = parameters.neuron_model
+    neuron_params = parameters.neuron_params
+    
+    local_recurrent_pyr_synapse_params = parameters.local_recurrent_pyr_synapse_params
+    local_l4_to_l23_synapse_params     = parameters.local_l4_to_l23_synapse_params
+    pyr_to_inh_synapse_params       = parameters.pyr_to_inh_synapse_params
+    
+    L23_per_MC = parameters.L23_per_MC
+    L4_per_MC = parameters.L4_per_MC
+    
+    # build a minicolumn
+    L23_pyr = nest.Create(neuron_model, L23_per_MC , neuron_params)
+    L4_pyr = nest.Create(neuron_model, L4_per_MC, neuron_params) 
+    nest.SetStatus(L4_pyr, {'b': 0.})                              # switch off adaptation
+    
+    # Local static connections
+    conn_dict = {'rule':'pairwise_bernoulli', 'p': parameters.prob_pyr2pyr_recurrent, 'autapses': False, 'multapses': False}
+    nest.Connect(L23_pyr, L23_pyr, conn_dict, local_recurrent_pyr_synapse_params)
 
-def PreloadMeans(params, model, net, load_MCs=True, load_WTA=True, load_attractors=True, load_globalinhibition=False, MC_gain=1, WTA_gain=1, gi_gain=1):  # add gain factors to control this
+    conn_dict = {'rule':'pairwise_bernoulli', 'p': parameters.prob_L4_to_L23, 'autapses': False, 'multapses': False}
+    nest.Connect(L4_pyr, L23_pyr, conn_dict, local_l4_to_l23_synapse_params)
+    
+    conn_dict = {'rule':'pairwise_bernoulli', 'p': parameters.prob_pyr2inh, 'autapses': False, 'multapses': False}
+    nest.Connect(L23_pyr, basket_nodes, conn_dict, pyr_to_inh_synapse_params)
+    
+    
+    MC_nodes = {'L23_pyr':L23_pyr, 'L4_pyr': L4_pyr, 'basket_cells': basket_nodes}
+    return MC_nodes
+
+
+def CreateHC():
+    n_MC_per_HC = parameters.n_MC_per_HC
+    basket_cells_per_MC = parameters.inh_per_MC
+    
+    all_MC_populations_in_this_HC = []
+
+    # create basket cells
+    basket_cells = nest.Create(parameters.neuron_model, n_MC_per_HC, parameters.neuron_params)
+    nest.SetStatus(basket_cells, {'b': 0.}) # switch off adaptation
+    
+    L23_population_in_this_HC = []
+    for mc in range(n_MC_per_HC):
+        basket_nodes = random.sample(basket_cells, basket_cells_per_MC)
+        MC_nodes = CreateMC(tuple(basket_nodes))
+        all_MC_populations_in_this_HC.append(MC_nodes)
+        
+        L23_population_in_this_HC.append(MC_nodes['L23_pyr'])
+        
+    L23_population_in_this_HC = tuple(np.array(L23_population_in_this_HC).flatten())
+    # connect basket cells
+    inh_to_pyr_synapse_params       = parameters.inh_to_pyr_synapse_params
+    conn_dict = {'rule':'pairwise_bernoulli', 'p': parameters.prob_inh2pyr, 'autapses': False, 'multapses': False}
+    nest.Connect(basket_cells, L23_population_in_this_HC, conn_dict, inh_to_pyr_synapse_params)
+    
+    #SHARED NEURONS (todo in the future)
+    #take an argument that specifies how many neurons to share. (could be a percentage e.g. 10% shared neurons)
+    #select a number of nodes and return them to be shared between this and another HC
+    
+    return all_MC_populations_in_this_HC
+
+
+def createModel():
+    
+    # Build network architecture
+    n_HC_desired = parameters.n_HC_desired
+    
+    all_HC_populations_in_this_net = []
+    for mc in range(n_HC_desired):
+        HC_nodes = CreateHC()
+        all_HC_populations_in_this_net.append(HC_nodes)
+        
+    # Get population dictionaries at all levels
+    MC_lvl_pops, HC_lvl_pops, Global_lvl_pops = GetPopulations_per_lvl(all_HC_populations_in_this_net)
+
+    # Connect noise input
+    zmn_nodes_L23e = []
+    zmn_nodes_L23i = []
+    for hypercolumn in range(len(MC_lvl_pops)):
+        rate = parameters.L23_zmn_rate[hypercolumn]
+        zmn_nodes_L23e.append(nest.Create('poisson_generator',params={'rate': rate})) 
+        zmn_nodes_L23i.append(nest.Create('poisson_generator',params={'rate': rate}))
+        
+        target_population = HC_lvl_pops[hypercolumn]['L23_pyr']
+        nest.Connect(zmn_nodes_L23e[hypercolumn], target_population, parameters.noise_conn_dict, parameters.noise_syn_e)
+        nest.Connect(zmn_nodes_L23i[hypercolumn], target_population, parameters.noise_conn_dict, parameters.noise_syn_i)
+        
+    # Connect recording devices
+    ## spike detectors from the whole population
+    recordfromL23 = Global_lvl_pops['L23_pyr']
+    recordfromL4 = Global_lvl_pops['L4_pyr']
+    recordfrominh = Global_lvl_pops['basket_cells']
+
+    L23_rec_spikes = nest.Create('spike_detector')         
+    L4_rec_spikes = nest.Create('spike_detector')
+    inh_rec_spikes = nest.Create('spike_detector')
+    
+    nest.Connect(recordfromL23, L23_rec_spikes, parameters.SD_conn_dict, parameters.SD_syn_dict) 
+    nest.Connect(recordfromL4, L4_rec_spikes, parameters.SD_conn_dict, parameters.SD_syn_dict)
+    nest.Connect(recordfrominh, inh_rec_spikes, parameters.SD_conn_dict, parameters.SD_syn_dict)
+    
+    ### Extra spike detector to compute cv2 from an arbitrary background neuron
+    extrasd = nest.Create('spike_detector')
+    #nest.Connect([2000],extrasd)
+        
+    ## record membrane potential from 2 L23_pyr neurons per MC 
+    multimeters_per_MC = []
+    for hc in range(len(MC_lvl_pops)):
+        for mc in range(len(MC_lvl_pops[hc])):
+            multimeter = nest.Create('multimeter', params={'interval': parameters.multimeter_interval,
+                                                           'record_from': parameters.multimeterkeys,
+                                                           'withgid': True,
+                                                           'withtime': True, 'start': 0.})
+        
+            #multimeter_pop_MC = random.sample(MC_lvl_pops[hc][mc]['L23_pyr'],2)
+            multimeter_pop_MC = MC_lvl_pops[hc][mc]['L23_pyr'][:parameters.mm_n_per_MC]  
+            
+            nest.Connect(multimeter, multimeter_pop_MC)
+            multimeters_per_MC.append(multimeter)
+
+    # return nodes, noise, devices
+    model = {'population_nodes': [MC_lvl_pops, HC_lvl_pops, Global_lvl_pops], 
+             'noise_nodes':      [zmn_nodes_L23e, zmn_nodes_L23i], 
+             'device_nodes':     [L23_rec_spikes, L4_rec_spikes, inh_rec_spikes, multimeters_per_MC, extrasd] }
+    
+    return model
+    
+
+#____________Functions involved in defining network topology_____________#
+def GenerateRadialPoints(center_x, center_y, mean_radius, sigma_radius, num_points):
+    points = []
+    for theta in np.linspace(0, 2*math.pi - (2*math.pi/num_points), num_points):
+        radius = random.gauss(mean_radius, sigma_radius)
+        x = round(center_x + radius * math.cos(theta),4)
+        y = round(center_y + radius * math.sin(theta),4)
+        points.append([x,y])
+    return np.array(points)
+
+
+def CreateNetworkGrid():
+    # Create a square grid where each square is an HC spanning 0.64 mm
+    rows = cols = int(np.sqrt(parameters.n_HC_desired))
+    interHC_grid_X, interHC_grid_Y = np.meshgrid(np.linspace(0.,parameters.HC_spatial_extent,rows),
+                                                 np.linspace(0.,parameters.HC_spatial_extent,cols))
+    grid = [interHC_grid_X, interHC_grid_Y]
+    
+    # Organize MC centers radially around each HC center
+    mc_centers = []
+    for whichHC in range(parameters.n_HC_desired):
+        
+        inter_grid_row = whichHC // int(np.sqrt(parameters.n_HC_desired))
+        inter_grid_col = whichHC % int(np.sqrt(parameters.n_HC_desired))
+        HC_center = [grid[0][inter_grid_row][inter_grid_col] + parameters.HC_spatial_extent/2, 
+                     grid[1][inter_grid_row][inter_grid_col] + parameters.HC_spatial_extent/2]
+        
+        #mc_centers.append(OrganizeMCsAround(HC_center)) # organize MCs in different rings around HC center
+        mc_centers.append(GenerateRadialPoints(HC_center[0], HC_center[1], parameters.HC_spatial_extent/2, 0., parameters.n_MC_per_HC))   # all mcs isapexoun apo to HC center (one ring only)
+       
+    return mc_centers   # = [HC0, HC1, ...], HC0 = [MC0center, MC1center, ...], MC0center = [x,y]
+    
+    
 
 
 
-    print('Preloading %s', net)
-    print('...from Means')
-    PreloadMeans = {'Intra_HC': {'Intra_MC': {'AMPA': [0.10, 0.09, 0.26], 'NMDA': [0.10, 0.09, 0.050]},
-                                 'Inter_MC': {'AMPA': [0.10, 0.10, 8.10e-05], 'NMDA': [0.10, 0.10, 0.006]}},
-                    'Inter_HC': {'Intra_MC': {'AMPA': [0.10, 0.06, 0.13], 'NMDA': [0.10, 0.06, 0.036]},
-                                 'Inter_MC': {'AMPA': [0.10, 0.10, 7.72e-05 * gi_gain],
-                                              'NMDA': [0.10, 0.10, 0.006]}}}  # means extracted from LTMaSample
-
-    # loading of biases to be integrated with connection initialization
-    print('...loading biases')
-    # nrn_dict={'p_j':0.1,'bias':np.log(0.1)} #means extracted from LTMaSample
-    # nest.SetStatus(model[net]['L23e_pop'],nrn_dict)
-    # -----------------------------------------------------------------------------------------------------
-
-    print('...categorizing and collecting connections to be modified')
-    AllMCs = range(params[net]['SIZE']['n_MC'])
-    conn_MC = {'AMPA': [], 'NMDA': []}
-    conn_WTA = {'AMPA': [], 'NMDA': []}
-    conn_attractor = {'AMPA': [], 'NMDA': []}
-    for mc_pre in AllMCs:
-        for mc_post in AllMCs:
-            if params[net]['SIZE']['HC_MC'][mc_pre] == params[net]['SIZE']['HC_MC'][mc_post]:
-                HCkey = 'Intra_HC'
-            else:
-                HCkey = 'Inter_HC'
-            if mc_pre == mc_post:
-                MCkey = 'Intra_MC'  # within exact same MC
-            elif ((mc_pre % params[net]['SIZE']['n_MC_per_HC'] == mc_post % params[net]['SIZE']['n_MC_per_HC']) & (
-                    mc_pre != mc_post)):  # same RESPECTIVE MC across HCs
-                MCkey = 'Intra_MC'
-            else:
-                MCkey = 'Inter_MC'
-
-                # now use this information to collect on connections
-            if (HCkey == 'Intra_HC') & (MCkey == 'Intra_MC') & (load_MCs):
-                for receptor in params[net]['SYN']['receptors']:
-                    conn_MC[receptor] += nest.GetConnections(source=model[net]['L23e_pop_MC'][mc_pre],
-                                                             target=model[net]['L23e_pop_MC'][mc_post],
-                                                             synapse_model=receptor + '_synapse_' + net)
-            if (HCkey == 'Intra_HC') & (MCkey == 'Inter_MC') & (load_WTA):
-                for receptor in params[net]['SYN']['receptors']:
-                    conn_WTA[receptor] += nest.GetConnections(source=model[net]['L23e_pop_MC'][mc_pre],
-                                                              target=model[net]['L23e_pop_MC'][mc_post],
-                                                              synapse_model=receptor + '_synapse_' + net)
-            if (HCkey == 'Inter_HC') & (MCkey == 'Intra_MC') & (load_attractors):
-                for receptor in params[net]['SYN']['receptors']:
-                    conn_attractor[receptor] += nest.GetConnections(source=model[net]['L23e_pop_MC'][mc_pre],
-                                                                    target=model[net]['L23e_pop_MC'][mc_post],
-                                                                    synapse_model=receptor + '_synapse_' + net)
-
-                    # now act on collected connections accordingly
-    """
-    if load_globalinhibition:
-        logging.info('%s set global inhibition', net)
-        for receptor in params[net]['SYN']['receptors']:
-            gi_dict={'p_i':PreloadMeans['Inter_HC']['Inter_MC'][receptor][0],
-                     'p_j':PreloadMeans['Inter_HC']['Inter_MC'][receptor][1],
-                     'p_ij':PreloadMeans['Inter_HC']['Inter_MC'][receptor][2]} #only one dict (saves memory)
-            #if receptor=='AMPA':
-            #    gi_dict['p_ij']*=gi_gain         
-            nest.SetStatus(model[net][receptor+'_connections'],gi_dict)#update all connections with this dictionary
-            logging.info('MC %s receptors load %s', receptor, gi_dict)
-        logging.info('%s global inhibition completed', net)
-    if load_MCs:
-        logging.info('%s MC loading started', net)
-        for receptor in params[net]['SYN']['receptors']:
-            MC_dict={'p_i':PreloadMeans['Intra_HC']['Intra_MC'][receptor][0],
-                     'p_j':PreloadMeans['Intra_HC']['Intra_MC'][receptor][1],
-                     'p_ij':PreloadMeans['Intra_HC']['Intra_MC'][receptor][2]*MC_gain} 
-            nest.SetStatus(conn_MC[receptor],MC_dict)#update MC recurrent connections with this dictionaries
-            logging.info('MC %s receptors load %s', receptor, MC_dict)
-        logging.info('%s MC loading completed', net)
-    if load_WTA:
-        logging.info('%s WTA loading started', net)
-        for receptor in params[net]['SYN']['receptors']:
-            WTA_dict={'p_i':PreloadMeans['Intra_HC']['Inter_MC'][receptor][0],
-                      'p_j':PreloadMeans['Intra_HC']['Inter_MC'][receptor][1],
-                      'p_ij':PreloadMeans['Intra_HC']['Inter_MC'][receptor][2]/WTA_gain} 
-            nest.SetStatus(conn_WTA[receptor],WTA_dict)#update MCs WTA connections with this dictionaries
-            logging.info('WTA %s receptors load %s', receptor, WTA_dict)
-        logging.info('%s WTA loading completed', net)
-    if load_attractors:
-        logging.info('%s attractor loading started', net)
-        for receptor in params[net]['SYN']['receptors']:
-            attractor_dict={'p_i':PreloadMeans['Inter_HC']['Intra_MC'][receptor][0],
-                            'p_j':PreloadMeans['Inter_HC']['Intra_MC'][receptor][1],
-                            'p_ij':PreloadMeans['Inter_HC']['Intra_MC'][receptor][2]}
-            logging.info('attractor %s receptors load %s', receptor, attractor_dict)
-            nest.SetStatus(conn_attractor[receptor],attractor_dict)
-        logging.info('%s attractor loading completed', net)
-    logging.info('%s all preload completed \n', net)
-    """
-    return
-
-def stim_matrix_generator(n_new_patterns, params, net, pattern_type='orthogonal'):
-
-    S = params[net]['SIZE']
-    stim_matrix = [[0 for mc in range(params[net]['SIZE']['n_MC'])] for n in range(n_new_patterns)]
-
+#____________Functions involved in Preloading Memories___________________#
+def GenerateMemoryPatterns(n_new_patterns, pattern_type='orthogonal'):
+    totalmcs = parameters.n_HC_desired * parameters.n_MC_per_HC
+    stim_matrix = [[0 for mc in range(totalmcs)] for n in range(n_new_patterns)]
+    
     if pattern_type == 'orthogonal':
-        if n_new_patterns <= params[net]['SIZE']['n_MC_per_HC']:
+        if n_new_patterns <= parameters.n_MC_per_HC:
             for idx in range(n_new_patterns):
-                MC0_HC = range(0, params[net]['SIZE']['n_MC'], params[net]['SIZE']['n_MC_per_HC'])
-                for hc in range(params[net]['SIZE']['n_HC']):
+                MC0_HC = range(0, totalmcs, parameters.n_MC_per_HC)
+                for hc in range(parameters.n_HC_desired):
                     stim_matrix[idx][MC0_HC[hc] + idx] = 1
         else:
-            print('not possible to create this many orthogonal patterns')
+            print('Not possible to create this many orthogonal patterns')
     elif pattern_type == 'random':
         for idx in range(n_new_patterns):
-            MC0_HC = range(0, params[net]['SIZE']['n_MC'], params[net]['SIZE']['n_MC_per_HC'])
-            randomMC_HC = list(np.random.randint(0, params[net]['SIZE']['n_MC_per_HC'], params[net]['SIZE']['n_HC']))
-            for hc in range(params[net]['SIZE']['n_HC']):
+            MC0_HC = range(0, totalmcs, parameters.n_MC_per_HC)
+            randomMC_HC = list(np.random.randint(0, parameters.n_MC_per_HC, parameters.n_HC_desired))
+            for hc in range(parameters.n_HC_desired):
                 stim_matrix[idx][MC0_HC[hc] + randomMC_HC[hc]] = 1
     else:
-        print('pattern type not specified correctly')
+        print('Pattern type not specified correctly')
+    
     return stim_matrix
 
-def GetPatternNodes(pattern,model,net,returntype):
-    if returntype=='pop':
-        MC_population=model[net]['L23e_pop_MC']
-    elif returntype=='rec':
-        MC_population=model[net]['L23e_rec_MC']
-    else:
-        print('Error. GetPatternNodes expects a valid returntype')
-    cells=[]
-    for mc in range(len(pattern)):#Parsing the pattern
-            if pattern[mc]==1: #small change from !=0
-                cells.extend(MC_population[mc])
+
+def GetPatternNodes(pattern, model):
+    cells = []
+    for mc in range(len(pattern)):
+        hc_idx = int(mc/parameters.n_MC_per_HC)
+        mc_idx = mc % parameters.n_MC_per_HC
+        if pattern[mc]==1:
+            cells.extend(model['population_nodes'][0][hc_idx][mc_idx]['L23_pyr'])
     return cells
 
-def add_stim_schedule(Phase, offset, model):
-    # offset is the timepoint at which the provided stim_matrix is inserted into NEST
-    # added_stim_schedule is stored into the Phase and also applied to NEST
-    # the passed Phase contains the stim-matrix and other relevant stim parameters
-    new_events = []  # to be appended to the main stim_schdule (a list of event dictionaries) in the model dict AFTER full processing
-    for net in ['STM', 'LTMa', 'LTMb']:
-        for time_idx in range(len(Phase['stim_matrix'][net])):  # Parsing the stim_matrix
-            pattern = Phase['stim_matrix'][net][time_idx]
-            pattern_no = Phase['trained_patterns'][net].index(pattern)
-            new_events.append({
-                'rate': Phase['stim_rate'][net],
-                # *stim_matrix[time_idx][mc], could be used to generate graded stimulation
-                'pattern': pattern_no,
-                'target': GetPatternNodes(pattern, model, net, 'pop'),
-                'startms': offset + Phase['stim_gap'][net] + time_idx * (
-                            Phase['stim_gap'][net] + Phase['stim_length'][net]),
-                'stopms': offset + (time_idx + 1) * (Phase['stim_gap'][net] + Phase['stim_length'][net]),
-                'weight': Phase['stim_weight'][net],  # stim node connection strength
-                'delay': Phase['stim_delay'][net],  # stim node connection delay
-                'synapse': 'stim_synapse_' + net  # stim connector model
-            })
-            # also update the pattern training times tracker with this new event:
-            if pattern_no < len(Phase['pattern_training_log'][net]):
-                # pattern that has an index in the pattern_training_log list
-                Phase['pattern_training_log'][net][pattern_no].append(
-                    (new_events[-1]['startms'], new_events[-1]['stopms']))
-            else:  # a'new' pattern'
-                Phase['pattern_training_log'][net].append([(new_events[-1]['startms'], new_events[-1]['stopms'])])
-    Phase['added_stim_schedule'] = new_events  # finally add all new events to the schedule
 
-    # Connect Stimulation according to the new events
-    for stim_event in new_events:
-        if stim_event['rate'] > 0:
-            new_stim_node = nest.Create('poisson_generator', \
-                                        params={'rate': stim_event['rate'], \
-                                                'start': stim_event['startms'], \
-                                                'stop': stim_event['stopms']})
-            syn_dict = {'model': stim_event['synapse'], 'weight': stim_event['weight'], 'delay': stim_event['delay']}
-            conn_dict = {'rule': 'all_to_all', 'autapses': False, 'multapses': True}  # Nest 2.4+
-            nest.Connect(new_stim_node, stim_event['target'], conn_dict, syn_dict)  # Nest 2.4+
-            # nest.DivergentConnect(new_stim_node,stim_event['target'], model=syn_dict['model'],weight=syn_dict['weight'],delay=syn_dict['delay'])  #adjusted for nest 2.2.2
-    return  # the Phase was passed as a reference and is thus already updated with 'added_stim_schedule'
+def ComputeLongRangeDelay(mc_pre_idx, mc_post_idx):
+    delay = 1.0
+    mc_centers = parameters.mc_centers
+    
+    # compute coordinates for pre and post
+    whichHC = mc_pre_idx // parameters.n_MC_per_HC
+    whichMCinHC = mc_pre_idx % parameters.n_MC_per_HC
+    pre  = mc_centers[whichHC][whichMCinHC]
+    
+    whichHC = mc_post_idx // parameters.n_MC_per_HC
+    whichMCinHC = mc_post_idx % parameters.n_MC_per_HC
+    post = mc_centers[whichHC][whichMCinHC]
+    
+    # compute distance between mc_pre and mc_post
+    distance = np.linalg.norm(pre-post)
+    #print(distance)
+    
+    # compute delay
+    delay = delay + (distance / parameters.conductance_speed)
+    
+    return delay
 
-def add_cue_stimulation(Phase,offset,model):
-    #Connect Stimulation according to the cue activation provided
-    for net in ['STM']:
-        pattern=Phase['stim_matrix'][net]#is a vector, not a matrix
-        new_stim_node=nest.Create('poisson_generator',\
-        params={'rate' : Phase['stim_rate'][net],\
-                'start': offset,\
-                'stop' : offset+Phase['cuetime'][net]})
-        syn_dict = {'model': 'stim_synapse_'+net,'weight': Phase['stim_weight'][net], 'delay': Phase['stim_delay'][net]}
-        conn_dict = {'rule': 'all_to_all',   'autapses': False,  'multapses': True}# Nest 2.4+
-        nest.Connect(new_stim_node,GetPatternNodes(pattern,model,net,'pop'), conn_dict, syn_dict) #Nest 2.4+
-        #nest.DivergentConnect(new_stim_node,GetPatternNodes(pattern,model,net,'pop'), model=syn_dict['model'],weight=syn_dict['weight'],delay=syn_dict['delay'])  #adjusted for nest 2.2.2
 
+
+def LoadMemories(number_of_memories, model):
+    
+    # create orthogonal patterns
+    orthogonal_memories = GenerateMemoryPatterns(number_of_memories)
+    # get all neurons by MC
+    MC_population=model['population_nodes'][0]
+    
+    # define plastic synapse models
+    nest.CopyModel(parameters.plastic_synapse_model, 'AMPA_synapse', parameters.AMPA_synapse_params)
+    nest.CopyModel(parameters.plastic_synapse_model, 'NMDA_synapse', parameters.NMDA_synapse_params)
+    
+    # for each pattern, connect pyr neurons with 0.3 prob (tsodyks) (both AMPA+NMDA connections)
+    for pattern in orthogonal_memories:
+        # get mc indices that are connected in this pattern (where pattern[i]==1)
+        participating_MCs = np.where(np.array(pattern)==1)[0]
+
+        # connect MC pairs with 0.3 prob (l23e pop) double forloop for all mcs from previous step
+        for mc_pre in participating_MCs:
+            for mc_post in participating_MCs:
+                if mc_pre!=mc_post: # to ensure that connections are only drawn between different MCs
+ 
+                    # select neurons belonging to the orthogonal pattern
+                    pre_pop = MC_population[int(mc_pre/parameters.n_MC_per_HC)][mc_pre % parameters.n_MC_per_HC]['L23_pyr']
+                    post_pop = MC_population[int(mc_post/parameters.n_MC_per_HC)][mc_post % parameters.n_MC_per_HC]['L23_pyr']
+                    
+                    conn_dict = {'rule':'pairwise_bernoulli', 'p': parameters.prob_pyr2pyr_longrange, 
+                                 'autapses': False, 'multapses': False}  
+
+                    delay = ComputeLongRangeDelay(mc_pre, mc_post)
+                    syn_dict = {'model': 'AMPA_synapse', 'delay': delay}
+                    nest.Connect(pre_pop, post_pop,conn_dict, syn_dict)
+
+                    # retrieve the connections we just created
+                    AMPA_conns = nest.GetConnections(source=pre_pop,target=post_pop, synapse_model='AMPA_synapse')
+                    AMPA_status = nest.GetStatus(AMPA_conns)
+
+                    # Dither 
+                    dither = parameters.delay_dither_relative_sd
+                    if dither > 0.:
+                        delays = nest.GetStatus(AMPA_conns, 'delay')
+                        #print(delays[0])
+                        dithered_delays = [{'delay': max(1.5, round(np.random.normal(delays[i], delays[i] * dither), 1))}
+                                            for i in range(len(AMPA_conns))]
+                        nest.SetStatus(AMPA_conns, dithered_delays)
+                        #print(dithered_delays[0])
+                    
+                    # Add NMDA 
+                    for status in AMPA_status:
+                        my_syn_dict = {'model': 'NMDA_synapse', 'weight': status['weight'], 'delay': status['delay']}  
+                        nest.Connect([status['source']], [status['target']], syn_spec = my_syn_dict)
+                        
+                           
+    return orthogonal_memories
+
+
+#____________Functions involved in computing firing statistics___________#
+
+def ComputeCV2(v, with_nan=False):
+    """
+    Calculate the measure of CV2 for a sequence of time intervals between 
+    events.
+
+    Given a vector v containing a sequence of intervals, the CV2 is
+    defined as:
+
+    .math $$ CV2 := \\frac{1}{N}\\sum_{i=1}^{N-1}
+
+                   \\frac{2|isi_{i+1}-isi_i|}
+                          {|isi_{i+1}+isi_i|} $$
+
+    The CV2 is typically computed as a substitute for the classical
+    coefficient of variation (CV) for sequences of events which include
+    some (relatively slow) rate fluctuation.  As with the CV, CV2=1 for
+    a sequence of intervals generated by a Poisson process.
+
+    Parameters
+    ----------
+
+    v : quantity array, numpy array or list
+        Vector of consecutive time intervals
+
+    with_nans : bool, optional
+        If `True`, cv2 with less than two spikes results in a `NaN` value 
+        and a warning is raised. 
+        If `False`, an attribute error is raised. 
+        Default: `True`
+
+    Returns
+    -------
+    cv2 : float
+       The CV2 of the inter-spike interval of the input sequence.
+
+    Raises
+    ------
+    ValueError :
+       If an empty list is specified, or if the sequence has less
+       than two entries, an AttributeError will be raised.
+    ValueError :
+        Only vector inputs are supported.  If a matrix is passed to the
+        function an AttributeError will be raised.
+
+    References
+    ----------
+    ..[1] Holt, G. R., Softky, W. R., Koch, C., & Douglas, R. J. (1996). 
+    Comparison of discharge variability in vitro and in vivo in cat visual 
+    cortex neurons. Journal of neurophysiology, 75(5), 1806-1814.
+    """
+    # convert to array, cast to float  
+    v = np.asarray(v)
+
+    # ensure the input ia a vector
+    if len(v.shape) > 1:
+        raise ValueError("Input shape is larger than 1. Please provide "
+                             "a vector as an input.")
+
+    # ensure we have enough entries
+    if v.size < 2:
+        if with_nan:
+            warnings.warn("Input size is too small. Please provide"
+                          "an input with more than 1 entry. cv2 returns `NaN`"
+                          "since the argument `with_nan` is `True`")
+            return np.NaN
+        else:
+            raise ValueError("Input size is too small. Please provide "
+                                 "an input with more than 1 entry. cv2 returns any"
+                                 "value since the argument `with_nan` is `False`")
+
+    # calculate CV2 and return result
+    return 2. * np.mean(np.absolute(np.diff(v)) / (v[:-1] + v[1:]))
+
+
+def isi(spiketrain, axis=-1):
+    """
+    Return an array containing the inter-spike intervals of the SpikeTrain.
+
+    Parameters
+    ----------
+
+    spiketrain : NumPy ndarray
+                 The spike times.
+    axis : int, optional
+           The axis along which the difference is taken.
+           Default is the last axis.
+
+    Returns
+    -------
+
+    NumPy array or quantities array.
+
+    """
+    if axis is None:
+        axis = -1
+    
+    intervals = np.diff(np.sort(spiketrain), axis=axis)
+    return intervals
+
+
+
+#________________Functions involved in parsing the network and plotting________________#
+def GetPopulations_per_lvl(fullnet):
+    # gets as input the full dictionary containing all nodes organized per population in each MC
+    # return 3 dictionaries at different levels of organization
+    
+    # mc level returns the population nodes in that particular mc (trivial, simply return the full dict)
+    mc_lvl_pops = fullnet
+    
+    # hc level returns the population nodes in each HC
+    hc_lvl_pops = [{'L23_pyr':[],'L4_pyr':[],'basket_cells':[]} for hc in range(len(fullnet))]
+    
+    for hc in range(len(fullnet)):
+        for mc in fullnet[hc]:
+            hc_lvl_pops[hc]['L23_pyr']      += list(mc['L23_pyr'])
+            hc_lvl_pops[hc]['L4_pyr']       += list(mc['L4_pyr'])
+            hc_lvl_pops[hc]['basket_cells'] += list(mc['basket_cells'])
+            
+            # remove duplicates because basket cells of MCs overlap
+            hc_lvl_pops[hc]['basket_cells'] = list(dict.fromkeys(list(hc_lvl_pops[hc]['basket_cells'])))
+          
+    # global level returns the population nodes in the whole network
+    global_lvl_pops = {'L23_pyr':[],'L4_pyr':[],'basket_cells':[]}
+    
+    for hc in range(len(fullnet)):
+        global_lvl_pops['L23_pyr']          += hc_lvl_pops[hc]['L23_pyr']
+        global_lvl_pops['L4_pyr']           += hc_lvl_pops[hc]['L4_pyr']
+        global_lvl_pops['basket_cells']     += hc_lvl_pops[hc]['basket_cells']
+
+    
+    '''
+    for hc in fullnet:
+        for mc in hc:
+            global_lvl_pops['L23_pyr']      += list(mc['L23_pyr'])
+            global_lvl_pops['L4_pyr']       +=list(mc['L4_pyr'])
+            global_lvl_pops['basket_cells'] +=list(mc['basket_cells'])
+    
+    
+    # flatten the resulting list of lists of nodes (DO IT BETTER WITHOUT FOR LOOP?)
+    for pop in global_lvl_pops:
+        global_lvl_pops[pop] = tuple(np.concatenate(global_lvl_pops[pop]))
+    
+    for hc in range(len(fullnet)):
+        for pop in global_lvl_pops:
+            hc_lvl_pops[hc][pop] = tuple(np.concatenate(hc_lvl_pops[hc][pop]))
+    '''
+    return mc_lvl_pops, hc_lvl_pops, global_lvl_pops
+
+
+def PlottingJoe(network):
+    # a function used to plot various stuff
+    spike_detector = network['device_nodes'][0]
+    dSD = nest.GetStatus(spike_detector, keys="events")[0]
+    
+    # PLOT ONLY ONE HC
+    nodes = network['population_nodes'][1][0]['L23_pyr'] # get the nodes we want to plot, here the first HC
+    evs = dSD["senders"]
+    ts = dSD["times"]
+    events = evs[np.where(np.isin(evs,nodes))]     # get indices of senders that are withing the range of nodes we want
+    times = ts[np.where(np.isin(evs,nodes))]       # using those indices get the corresponding times
+    print(len(times),'spikes')
+    plt.figure('l23 population spike raster one hc')
+    plt.title('l23 population spike raster one hc')
+    axes = plt.gca()
+    axes.set_xlim([0,2500])
+    #plt.plot(times, events, ".")
+    plt.scatter(times,events,s=1)
+
+    
+    
+    # PLOT THE WHOLE POPULATION
+    evs = dSD["senders"]
+    ts = dSD["times"]
+    print(len(ts),'spikes')
+    plt.figure('l23 population spike raster')
+    plt.title('l23 pop spike raster of the whole net')
+    plt.scatter(ts,evs,s=1)
+    
+    # PLOT THE WHOLE BASKET CELL POPULATION
+    spike_detector_bc = network['device_nodes'][2]
+    dSD = nest.GetStatus(spike_detector, keys="events")[0]
+    
+    ievs = dSD["senders"]
+    its = dSD["times"]
+    print(len(its),'spikes')
+    plt.figure('basket population spike raster')
+    plt.title('basket pop spike raster of the whole net')
+    plt.scatter(its,ievs,s=1)
+
+    
+    
+    # HISTOGRAM OF FIRING RATES of nodes
+    spikes = []         # spikes
+    for node in nodes:
+        spikes.append(np.count_nonzero(events == node))
+    #print(spikes)
+    rates = []  # spikes/sec or spikes/sim_time
+    cv2s = []   # measures how irregular is the spiking
+    for node in nodes:
+        spiketimes = times[np.where(events==node)]
+        if len(spiketimes)>2:
+            cv2s.append(ComputeCV2(isi(spiketimes)))
+    num_bins = 20
+    plt.figure('hist of spikes')
+    plt.title('hist of spikes of HC0 across the whole sim time')
+
+    n, bins, patches = plt.hist(spikes, num_bins)
+    
+    plt.figure('hist of cv2s')
+    plt.title('hist of cv2s of HC0')
+    n, bins, patches = plt.hist(cv2s, num_bins)
+    
+    
+    plt.show()
+
+
+
+#_________________Functions enabling simulation protocol___________________#
+def CuePattern():
+    # this is a function that given a pattern it finds the l23 pattern nodes and stimulates its respective l4
     return
 
-def RunPhase(Phase, model, program=[], OptDict={}):
-
-    ThisPhase = {}
-    ThisPhase = update(Phase, OptDict)  # possible updates to the Phase
-
-    while ThisPhase['name'] in [p['name'] for p in program]:  # making sure all Phasenames are unique
-        ThisPhase['name'] += 'I'
-    print('Current phase name is:', ThisPhase['name'])
-
-    print('Preparing Phase' , ThisPhase['name'],  'of length ', ThisPhase['length'])
-
-    for net in ['STM']:
-        ThisPhase = update(ThisPhase, {'trained_patterns': {net: []}, 'pattern_training_log': {net: []}})
-        if len(program) > 0:  # keep track of PREVIOUSLY learned patterns
-            ThisPhase['trained_patterns'][net] = program[-1]['trained_patterns'][net]
-            ThisPhase['pattern_training_log'][net] = program[-1]['pattern_training_log'][net]
-
-        nest.SetStatus(model[net]['L23e_pop'], ThisPhase['L23e_cell_params'][net])
-        nest.SetStatus(model[net]['AMPA_connections'], ThisPhase['AMPA_params'][net])
-        nest.SetStatus(model[net]['NMDA_connections'], ThisPhase['NMDA_params'][net])
-        nest.SetStatus(model[net]['i2e_connections'], ThisPhase['i2e_synapse_params'][net])
-        # nest.SetStatus(model[net]['AMPA_connections'],{'t_k': nest.GetKernelStatus('time')})
-        # nest.SetStatus(model[net]['NMDA_connections'],{'t_k': nest.GetKernelStatus('time')})
-        #nest.SetStatus(model[net]['zmn_nodes_L23e'], {'rate': ThisPhase['L23e_zmn_rate'][net]})
-        #nest.SetStatus(model[net]['zmn_nodes_L23i'], {'rate': ThisPhase['L23e_zmn_rate'][net]})
-        nest.SetStatus(model[net]['zmn_nodes_L4e'], {'rate': ThisPhase['L4e_zmn_rate'][net]})
-        nest.SetStatus(model[net]['zmn_nodes_L4i'], {'rate': ThisPhase['L4e_zmn_rate'][net]})
-        nest.SetStatus(model[net]['L4e_to_L23e_connections'], ThisPhase['L4e_to_L23e_params'][net])
-
-        for hypercolumn in range(len(model[net]['L23e_pop_HC'])):
-            nest.SetStatus(model[net]['zmn_nodes_L23e'][hypercolumn], {'rate': ThisPhase['L23e_zmn_rate'][net][hypercolumn]})
-            nest.SetStatus(model[net]['zmn_nodes_L23i'][hypercolumn], {'rate': ThisPhase['L23e_zmn_rate'][net][hypercolumn]})
 
 
 
-    if ThisPhase['type'] == 'stim':
-        for net in ['STM']:
-            for pattern in ThisPhase['stim_matrix'][net]:  # add the new patterns to the list of trained patterns
-                if pattern not in ThisPhase['trained_patterns'][net]:
-                    ThisPhase['trained_patterns'][net].append(pattern)
-        add_stim_schedule(ThisPhase, nest.GetKernelStatus('time'), model)
-        ThisPhase['length'] = np.max(
-            [len(ThisPhase['stim_matrix'][net]) * (ThisPhase['stim_gap'][net] + ThisPhase['stim_length'][net]) for net
-             in ['STM', 'LTMa', 'LTMb']])  # the Phase length is the duration of the longest net stimulation protocol
-
-    if ThisPhase['type'] == 'cue':
-        add_cue_stimulation(ThisPhase, nest.GetKernelStatus('time'), model)
-        ThisPhase['length'] = np.max([ThisPhase['cuetime'][net] for net in ['STM']])  # cues are short and simple (no gaps, and just one pattern)
-
-    ThisPhase['start'] = nest.GetKernelStatus('time')
-    print('Executing Phase' , ThisPhase['name'],  'of length ', ThisPhase['length'])
-    nest.Simulate(ThisPhase['length'])  # <-------------------- Actual Simulation command!
-    ThisPhase['stop'] = nest.GetKernelStatus('time')
-    print(' ...done. \n')
-
-    # plot spikes per population for debugging
-    all_populations = ['L23e_rec_spikes','L2e_rec_spikes', 'L3ae_rec_spikes', 'L3be_rec_spikes', 'L4e_rec_spikes', 'L2i_rec_spikes']
-    spikedetective_from_population = all_populations[0]
-    dSD = nest.GetStatus(model['STM'][spikedetective_from_population], keys="events")[0]
-    evs = dSD["senders"]
-    ts = dSD["times"]
-    print('In phase:', ThisPhase['name'], len(ts), ' spikes were recorded from population ',
-          spikedetective_from_population[:4])
-    print()
-    plt.figure(ThisPhase['name'])
-    plt.plot(ts, evs, ".")
-    # save figure to file
-    plt.savefig("plots/"+ThisPhase['name']+'_'+ spikedetective_from_population[:3] +'spikeraster'+'.png')
-
-    # ADDITION of plot of spikes per MC
-    which_MC = 3
-    dSD = nest.GetStatus(model['STM']['spike_recorder_per_MC'][which_MC], keys="events")[0]
-    evs = dSD["senders"]
-    ts = dSD["times"]
-    plt.figure('Spikes per MC')
-    plt.plot(ts, evs, ".")
-    plt.savefig("plots/"+ThisPhase['name']+'_from'+ str(which_MC) +'spikeraster'+'.png')
-
-    # plot membrane potential per MC
-    plotting_minicolumn = 4
-    dmm = nest.GetStatus(model['STM']['multimeter_MC'][plotting_minicolumn])[0]
-    Vms = dmm["events"]["V_m"]
-    ts = dmm["events"]["times"]
-    plt.figure('Membrane potential')
-    plt.plot(ts, Vms)
-    plt.savefig("plots/"+ThisPhase['name']+'_from'+ str(plotting_minicolumn) +'membrane potential'+'.png')
-    # """
-
-
-    plt.show()    
-
-    program.append(ThisPhase)  # Keeps an ordered list of the phases being run
-    return program
