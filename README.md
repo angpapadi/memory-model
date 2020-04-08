@@ -3,6 +3,7 @@
 simply go to a cell and write:
 
 %matplotlib inline
+
 import simulation
 
 
