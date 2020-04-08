@@ -8,6 +8,8 @@ import simulation
 
 
 ____________
+Right now the simulation is run for 8 seconds without any attractors just the background noise.
+
 This will show 5 plots
 1. a spike raster of pyramidal cells of HC0
 2. a spike raster of pyramidal cells of the whole network
