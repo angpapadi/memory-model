@@ -26,7 +26,7 @@ print('Total Runtime: {0:.2f} min'.format((stoptime-starttime)/60.))
 print('Model Construction Runtime: {0:.2f} min'.format((modelfinished-starttime)/60.))
 
 # Save device recordings to file
-helpers.SaveSimulationToFile('runs/simresults_'+str(int(stoptime)),network, memories)
+helpers.SaveSimulationToFile('simresults_'+str(int(stoptime)),network, memories)
 print('Simulation complete. Results have been saved to file.')
 
 
