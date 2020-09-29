@@ -4,7 +4,11 @@ simply go to a cell and write:
 
 %matplotlib inline
 
-import simulation
+import simulation                 #this calls the simulation script
+
+import post
+filename = 'Your/simulation-results-file/here'
+post.processing(filename)        #this generates spike rasters
 
 
 ____________
