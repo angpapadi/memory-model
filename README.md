@@ -12,7 +12,6 @@ post.processing(filename)        #this generates spike rasters
 
 
 ____________
-Right now the simulation is run for 8 seconds without any attractors just the background noise.
 
 This will show 5 plots
 1. a spike raster of pyramidal cells of MC0
