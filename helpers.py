@@ -284,7 +284,7 @@ def LoadMemories(number_of_memories, model, pattern_type= 'orthogonal'):
                     # retrieve the connections we just created
                     AMPA_conns = nest.GetConnections(source=pre_pop,target=post_pop, synapse_model='AMPA_synapse')
                     AMPA_status = nest.GetStatus(AMPA_conns)
-                    print(mc_pre,mc_post,len(AMPA_conns))
+                    #print(mc_pre,mc_post,len(AMPA_conns))
                     # Dither 
                     dither = parameters.delay_dither_relative_sd
                     if dither > 0.:
