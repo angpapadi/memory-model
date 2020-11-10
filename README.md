@@ -7,7 +7,9 @@ simply go to a cell and write:
 import simulation                 #this calls the simulation script 
 
 import post
+
 filename = 'filename-as-defined-in-the-end-of-simulation.py'
+
 post.processing(filename)        #this generates spike rasters
 
 
